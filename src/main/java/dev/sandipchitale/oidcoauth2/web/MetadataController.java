@@ -23,7 +23,10 @@ public class MetadataController {
                 "resource", "https://localhost:8443",
                 // The authorization server lives on localhost.apple.com.
                 "authorization_servers", List.of("https://localhost.apple.com:8443"),
-                "scopes_supported", List.of("openid", "profile", "READ", "WRITE"),
+                // RFC 9728: only THIS resource server's own scopes belong here. The OIDC scopes
+                // (openid, profile, email, ...) are the OP's and are advertised by the OP's metadata
+                // (/.well-known/openid-configuration), not by the resource server.
+                "scopes_supported", List.of("READ", "WRITE"),
                 "bearer_methods_supported", List.of("header")
         );
     }
