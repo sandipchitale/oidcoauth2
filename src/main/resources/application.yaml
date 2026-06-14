@@ -1,0 +1,21 @@
+# Location of the server's TLS leaf cert + key. Resolved from the per-user home
+# directory at runtime (no hardcoded absolute path, no dependency on the current
+# working directory). Override with the OIDCOAUTH2_CERT_DIR environment variable.
+app:
+  cert-dir: "${OIDCOAUTH2_CERT_DIR:${user.home}/.oidcoauth2/certs}"
+
+spring:
+  application:
+    name: oidcoauth2
+  ssl:
+    bundle:
+      pem:
+        my-server-bundle:
+          keystore:
+            certificate: "file:${app.cert-dir}/localhost.apple.com.crt"
+            private-key: "file:${app.cert-dir}/localhost.apple.com.key"
+
+server:
+  port: 8443
+  ssl:
+    bundle: my-server-bundle
