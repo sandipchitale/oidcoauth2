@@ -19,6 +19,8 @@ the difference between **authentication and authorization**, between **scope** a
 
 - **OAuth 2.1 Authorization Code + PKCE** for a **public client** (no secret).
 - **OpenID Connect**: ID token, `/userinfo`, standard scopes (`openid`, `profile`, `email`, …).
+- **RFC 7591 Dynamic Client Registration** — the SPA **discovers its own `client_id`** at runtime
+  (nothing is hard-coded) by POSTing its `client_name` to the advertised `registration_endpoint`.
 - **Three discovery documents** and the **MCP discovery order**:
   - RFC 9728 Protected Resource Metadata — `/.well-known/oauth-protected-resource`
   - RFC 8414 Authorization Server Metadata — `/.well-known/oauth-authorization-server`
@@ -75,7 +77,8 @@ src/main/java/dev/sandipchitale/oidcoauth2/
 │   ├── PublicClientRefreshTokenAuthenticationProvider.java   # lets a public client use refresh_token
 │   └── JwtRefreshTokenGenerator.java                    # JWT (not opaque) refresh tokens
 └── web/
-    ├── MetadataController.java                          # RFC 9728 protected-resource metadata
+    ├── IndexController.java                             # redirects / → /client.html
+    ├── ClientRegistrationController.java                # RFC 7591 Dynamic Client Registration (/connect/register)
     └── ResourceController.java                          # /get /post /whoami /whereami
 src/main/resources/
 ├── application.yaml                                    # port, TLS bundle (from ~/.oidcoauth2/certs)
@@ -178,6 +181,7 @@ The SPA (`client.html`) is a **fully stateless public client** — it holds toke
 | `/oauth2/token` | Token endpoint |
 | `/oauth2/jwks` | JWK set |
 | `/userinfo` | OIDC UserInfo (requires `openid`; `aud` must include the OP) |
+| `/connect/register` | RFC 7591 Dynamic Client Registration (returns the well-known client's `client_id`) |
 | `/.well-known/oauth-authorization-server` | RFC 8414 metadata (auto, Spring Authorization Server) |
 | `/.well-known/openid-configuration` | OIDC Discovery (auto) |
 | `/login` | Form login page |
@@ -208,7 +212,32 @@ The SPA (`client.html`) is a **fully stateless public client** — it holds toke
    - `oauth2ResourceServer().jwt()` using an **audience‑validating decoder** requiring the **RS** audience.
    - `accessDeniedHandler` emits `403` + `WWW-Authenticate: Bearer error="insufficient_scope", scope="…"`
      (the MCP **Scope Challenge**), `authenticationEntryPoint` emits `401 invalid_token`.
-3. **`@Order(3)` Default** — serves `/`, `/client.html`, the protected‑resource metadata, and form login.
+3. **`@Order(3)` Default** — serves `/`, `/client.html`, the `/connect/register` registration endpoint
+   (CSRF‑exempt, public), and form login.
+
+### Dynamic Client Registration (RFC 7591) — discovering the `client_id`
+
+The SPA does **not** hard‑code its `client_id`. Instead it discovers it at runtime:
+
+1. Discovery resolves `registration_endpoint` from the AS/OIDC metadata (advertised in both
+   `/.well-known/oauth-authorization-server` and `/.well-known/openid-configuration`).
+2. The SPA `POST`s an RFC 7591 client‑metadata document with `client_name: "client"` to it.
+3. `ClientRegistrationController` returns the pre‑registered client's **Client Information Response**
+   (its `client_id`, `redirect_uris`, `grant_types`, `scope`, …). The SPA uses that `client_id` for
+   the PKCE, token, and refresh requests.
+
+The pre‑registered client's `client_id` is an **opaque UUID** — configured (`app.client-id`) and
+**durable across restarts** so previously issued tokens stay valid. The SPA could never hard‑code it,
+so discovery is the *only* way to learn it. The match is on `client_name`, not `client_id`.
+
+This is intentionally **not** a general registrar — it mints no new clients. It exists purely to show
+client‑id *discovery*. Only `client_name: "client"` is honoured; any other name is rejected with an
+RFC 7591 `invalid_client_metadata` error:
+
+```http
+POST /connect/register   {"client_name":"client"}   →  201  { "client_id": "3f8a…-uuid", "client_name": "client", … }
+POST /connect/register   {"client_name":"other"}    →  400  { "error": "invalid_client_metadata", … }
+```
 
 ### How the access token's `aud` is set
 
@@ -260,6 +289,8 @@ complete with retry limits).
 ```yaml
 app:
   cert-dir: "${OIDCOAUTH2_CERT_DIR:${user.home}/.oidcoauth2/certs}"
+  # Durable public-client client_id (discovered by the SPA via RFC 7591). Override with OIDCOAUTH2_CLIENT_ID.
+  client-id: "${OIDCOAUTH2_CLIENT_ID:c1a9e0d2-7b3f-4e58-9a16-2f8d4c6b1e30}"
 spring:
   ssl:
     bundle:

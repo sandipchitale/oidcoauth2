@@ -3,6 +3,9 @@
 # working directory). Override with the OIDCOAUTH2_CERT_DIR environment variable.
 app:
   cert-dir: "${OIDCOAUTH2_CERT_DIR:${user.home}/.oidcoauth2/certs}"
+  # The public client's client_id. Durable across restarts (so previously issued tokens stay valid)
+  # and discovered by the SPA via RFC 7591 Dynamic Client Registration. Override with OIDCOAUTH2_CLIENT_ID.
+  client-id: "${OIDCOAUTH2_CLIENT_ID:c1a9e0d2-7b3f-4e58-9a16-2f8d4c6b1e30}"
 
 spring:
   application:

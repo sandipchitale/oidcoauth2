@@ -537,9 +537,15 @@
                 </div>
 
                 <div class="metadata-grid" style="margin-bottom: 1.25rem;">
+                    <span class="metadata-label">Client ID (via DCR):</span>
+                    <span class="metadata-value" id="client-id-display">not registered yet</span>
                     <span class="metadata-label">Users Available:</span>
                     <span class="metadata-value">user / password<br>user2 / password</span>
                 </div>
+
+                <button class="btn-secondary" id="btn-register" style="width: 100%; margin-bottom: 0.75rem;">
+                    <span>🪪</span> Register Client &amp; Discover ID (RFC 7591 DCR)
+                </button>
 
                 <button class="btn-primary" id="btn-login" style="width: 100%;">
                     <span>🔒</span> Authenticate / Request Access
@@ -687,7 +693,10 @@
 
     <script>
         // Core Configurations & State
-        const CLIENT_ID = 'client';
+        // The client_id is NOT hard-coded — it is discovered at runtime via RFC 7591 Dynamic Client
+        // Registration (see registerClient()), populated after metadata discovery resolves the
+        // registration_endpoint.
+        let CLIENT_ID = null;
         // Use the SPA's own origin as the redirect URI, so opening this page at
         // https://localhost:8443 returns to localhost, and https://localhost.apple.com:8443
         // returns to localhost.apple.com. Both are registered with the auth server. The
@@ -701,6 +710,7 @@
             authorizationEndpoint: null,
             tokenEndpoint: null,
             userInfoEndpoint: null,
+            registrationEndpoint: null, // RFC 7591 Dynamic Client Registration endpoint
             jwksUri: null
         };
 
@@ -904,14 +914,59 @@
             endpoints.jwksUri = primary.jwks_uri;
             // userinfo_endpoint is OIDC-only — it is absent from RFC 8414 metadata.
             endpoints.userInfoEndpoint = (oidcMeta && oidcMeta.userinfo_endpoint) || primary.userinfo_endpoint || null;
+            // registration_endpoint (RFC 7591) — advertised in both metadata documents.
+            endpoints.registrationEndpoint = primary.registration_endpoint
+                || (oidcMeta && oidcMeta.registration_endpoint)
+                || (asMeta && asMeta.registration_endpoint) || null;
 
             log('success', `Authorize: ${endpoints.authorizationEndpoint} | Token: ${endpoints.tokenEndpoint} | UserInfo: ${endpoints.userInfoEndpoint || 'n/a'}`);
+        }
+
+        // RFC 7591 Dynamic Client Registration — discover this SPA's client_id at runtime instead of
+        // hard-coding it. We send our well-known client_name ("client"); the server replies with the
+        // pre-registered client's metadata (Client Information Response) including its client_id.
+        async function registerClient() {
+            if (!endpoints.registrationEndpoint) {
+                log('error', 'No registration_endpoint discovered; cannot obtain client_id.');
+                return;
+            }
+            const disp = document.getElementById('client-id-display');
+            if (disp) disp.textContent = 'registering…';
+            log('info', `Registering via RFC 7591 Dynamic Client Registration at ${endpoints.registrationEndpoint} ...`);
+            try {
+                const response = await fetch(endpoints.registrationEndpoint, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        client_name: 'client',
+                        redirect_uris: [REDIRECT_URI],
+                        grant_types: ['authorization_code', 'refresh_token'],
+                        response_types: ['code'],
+                        token_endpoint_auth_method: 'none'
+                    })
+                });
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(`Registration failed (${response.status}): ${errText}`);
+                }
+                const data = await response.json();
+                CLIENT_ID = data.client_id;
+                if (disp) disp.textContent = CLIENT_ID;
+                log('success', `Dynamic Client Registration successful. Discovered client_id: "${CLIENT_ID}".`);
+            } catch (error) {
+                log('error', `Dynamic Client Registration error: ${error.message}`);
+                if (disp) disp.textContent = 'registration failed';
+            }
         }
 
         // Redirect to Authenticate with PKCE
         async function startLoginFlow(scope) {
             if (!endpoints.authorizationEndpoint) {
                 log('error', 'Auth metadata not resolved yet. Cannot start authentication.');
+                return;
+            }
+            if (!CLIENT_ID) {
+                log('error', 'client_id not yet discovered. Click "Register Client & Discover ID" first.');
                 return;
             }
 
@@ -960,6 +1015,10 @@
 
             if (savedState !== receivedState) {
                 log('error', `CRITICAL: State mismatch! Received: ${receivedState}, Saved: ${savedState}`);
+                return;
+            }
+            if (!CLIENT_ID) {
+                log('error', 'client_id not yet discovered (Dynamic Client Registration). Cannot exchange code.');
                 return;
             }
 
@@ -1018,6 +1077,10 @@
         async function performTokenRefresh() {
             if (!state.refreshToken) {
                 log('error', 'No refresh token available.');
+                return;
+            }
+            if (!CLIENT_ID) {
+                log('error', 'client_id not yet discovered (Dynamic Client Registration). Cannot refresh tokens.');
                 return;
             }
 
@@ -1448,6 +1511,7 @@
             log('info', 'To escalate credentials, select a broader scope (e.g. READ & WRITE) and authenticate again.');
         });
 
+        document.getElementById('btn-register').addEventListener('click', registerClient);
         document.getElementById('btn-refresh').addEventListener('click', performTokenRefresh);
         document.getElementById('btn-logout').addEventListener('click', logout);
         document.getElementById('btn-call-get').addEventListener('click', callGetApi);
@@ -1472,10 +1536,15 @@
                 log('info', `Authorization code detected in redirect: ${code}`);
                 // Clear URL arguments so page is clean
                 window.history.replaceState({}, document.title, window.location.pathname);
-                
-                // Wait until metadata is loaded to have tokenEndpoint ready
+
+                // Returning from the authorization redirect: the client_id is required to exchange the
+                // code, so re-run Dynamic Client Registration automatically here. On a fresh visit the
+                // user triggers it explicitly with the "Register Client & Discover ID" button.
+                await registerClient();
+
+                // Wait until metadata is loaded (tokenEndpoint) and the client_id is discovered.
                 let checkMetadataLoaded = setInterval(async () => {
-                    if (endpoints.tokenEndpoint) {
+                    if (endpoints.tokenEndpoint && CLIENT_ID) {
                         clearInterval(checkMetadataLoaded);
                         await exchangeCodeForTokens(code, receivedState);
                     }

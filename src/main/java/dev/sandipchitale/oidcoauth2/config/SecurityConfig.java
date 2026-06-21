@@ -7,6 +7,7 @@ import com.nimbusds.jose.jwk.source.ImmutableJWKSet;
 import com.nimbusds.jose.jwk.source.JWKSource;
 import com.nimbusds.jose.proc.SecurityContext;
 import org.jspecify.annotations.NonNull;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.core.annotation.Order;
@@ -38,6 +39,7 @@ import org.springframework.security.oauth2.jwt.NimbusJwtEncoder;
 import org.springframework.security.oauth2.server.authorization.authentication.OAuth2AuthorizationGrantAuthenticationToken;
 import org.springframework.security.oauth2.server.authorization.oidc.authentication.OidcUserInfoAuthenticationContext;
 import org.springframework.security.oauth2.server.authorization.oidc.authentication.OidcUserInfoAuthenticationToken;
+import org.springframework.security.oauth2.server.resource.OAuth2ProtectedResourceMetadataClaimNames;
 import org.springframework.security.oauth2.server.resource.authentication.JwtAuthenticationToken;
 import org.springframework.security.oauth2.server.authorization.client.InMemoryRegisteredClientRepository;
 import org.springframework.security.oauth2.server.authorization.client.RegisteredClient;
@@ -86,6 +88,9 @@ public class SecurityConfig {
     // The resource server's canonical URI (reached at localhost). A token is accepted at /get,/post only
     // if its 'aud' contains this value, which happens only when the client sent it as a resource indicator.
     private static final String RS_AUDIENCE = "https://localhost:8443";
+    // Our custom RFC 7591 Dynamic Client Registration endpoint (served by ClientRegistrationController),
+    // advertised as 'registration_endpoint' in the AS/OIDC metadata so the SPA can discover its client_id.
+    private static final String REGISTRATION_ENDPOINT = OP_AUDIENCE + "/connect/register";
 
     @Bean
     @Order(1)
@@ -104,13 +109,23 @@ public class SecurityConfig {
                 // The OAuth2 endpoints (e.g. the token endpoint POSTed by the stateless SPA) are not
                 // browser-form submissions and carry no CSRF token, so exclude them from CSRF protection.
                 .csrf((csrf) -> csrf.ignoringRequestMatchers(endpointsMatcher))
-                .with(authorizationServerConfigurer, (authorizationServer) ->
-                        authorizationServer.oidc(oidc -> oidc
-                                // Standard OIDC UserInfo: always returns 'sub', plus profile claims when the
-                                // 'profile' scope was granted. Access is gated by the 'openid' scope.
-                                .userInfoEndpoint(userInfo -> userInfo.userInfoMapper(SecurityConfig::userInfo))
-                        ) // Enable OpenID Connect 1.0
-                )
+                .with(authorizationServerConfigurer, (authorizationServer) -> {
+                    authorizationServer.oidc(oidc -> oidc
+                            // Standard OIDC UserInfo: always returns 'sub', plus profile claims when the
+                            // 'profile' scope was granted. Access is gated by the 'openid' scope.
+                            .userInfoEndpoint(userInfo -> userInfo.userInfoMapper(SecurityConfig::userInfo))
+                            // Advertise our custom RFC 7591 registration endpoint in the OIDC provider
+                            // configuration (/.well-known/openid-configuration) as 'registration_endpoint'.
+                            .providerConfigurationEndpoint(providerConfiguration -> providerConfiguration
+                                    .providerConfigurationCustomizer(builder -> builder
+                                            .clientRegistrationEndpoint(REGISTRATION_ENDPOINT)))
+                    ); // Enable OpenID Connect 1.0
+                    // Advertise the same 'registration_endpoint' in the RFC 8414 authorization server
+                    // metadata (/.well-known/oauth-authorization-server).
+                    authorizationServer.authorizationServerMetadataEndpoint(metadata -> metadata
+                            .authorizationServerMetadataCustomizer(builder -> builder
+                                    .clientRegistrationEndpoint(REGISTRATION_ENDPOINT)));
+                })
                 // Redirect to the login page when not authenticated from the authorization endpoint
                 .exceptionHandling((exceptions) -> exceptions
                         .defaultAuthenticationEntryPointFor(
@@ -188,10 +203,13 @@ public class SecurityConfig {
     @Order(2)
     public SecurityFilterChain resourceServerSecurityFilterChain(HttpSecurity http, JWKSource<SecurityContext> jwkSource) throws Exception {
         http
-                .securityMatcher("/get", "/post", "/whoami", "/whereami")
+                .securityMatcher("/get", "/post", "/whoami", "/whereami", "/.well-known/oauth-protected-resource")
                 .authorizeHttpRequests(authorize -> authorize
                         .requestMatchers(HttpMethod.GET, "/get").hasAuthority("SCOPE_READ")
                         .requestMatchers(HttpMethod.POST, "/post").hasAuthority("SCOPE_WRITE")
+                        // RFC 9728 protected resource metadata is public discovery — served by the
+                        // OAuth2ProtectedResourceMetadataFilter below, no token required.
+                        .requestMatchers(HttpMethod.GET, "/.well-known/oauth-protected-resource").permitAll()
                         // /whoami and /whereami require only a valid, audience-bound token — no scope.
                         .anyRequest().authenticated()
                 )
@@ -200,6 +218,19 @@ public class SecurityConfig {
                         // authorize the operation by scope. A token not minted for this RS (no resource
                         // indicator) is rejected with 401 before the scope check even runs.
                         .jwt(jwt -> jwt.decoder(audienceValidatingJwtDecoder(jwkSource, RS_AUDIENCE)))
+                        // RFC 9728 Protected Resource Metadata at /.well-known/oauth-protected-resource.
+                        // OAuth2ProtectedResourceMetadataFilter pre-seeds: resource (from the request URL),
+                        // bearer_methods_supported=["header"], tls_client_certificate_bound_access_tokens=true.
+                        // We pin resource to this RS's canonical URI, advertise the AS and this RS's own
+                        // scopes, and drop the mTLS claim since this RS issues no certificate-bound tokens.
+                        .protectedResourceMetadata(metadata -> metadata
+                                .protectedResourceMetadataCustomizer(builder -> builder
+                                        .resource(RS_AUDIENCE)
+                                        .authorizationServer(OP_AUDIENCE)
+                                        .scope("READ")
+                                        .scope("WRITE")
+                                        .claims(claims -> claims.remove(
+                                                OAuth2ProtectedResourceMetadataClaimNames.TLS_CLIENT_CERTIFICATE_BOUND_ACCESS_TOKENS))))
                         .accessDeniedHandler((request, response, accessDeniedException) -> {
                             String requiredScope = request.getRequestURI().equals("/get") ? "READ" : "WRITE";
                             // Per the MCP "Scope Challenge Handling" spec (Recommended approach): include the
@@ -237,13 +268,15 @@ public class SecurityConfig {
     public SecurityFilterChain defaultSecurityFilterChain(HttpSecurity http) throws Exception {
         http
                 .authorizeHttpRequests((authorize) -> authorize
-                        .requestMatchers("/", "/client.html", "/.well-known/oauth-protected-resource").permitAll()
+                        // /connect/register is the public RFC 7591 Dynamic Client Registration endpoint.
+                        .requestMatchers("/", "/client.html", "/connect/register").permitAll()
                         .anyRequest().authenticated()
                 )
+                // The registration endpoint is a cross-origin JSON POST from the SPA carrying no CSRF token.
+                .csrf(csrf -> csrf.ignoringRequestMatchers("/connect/register"))
                 // Form login handles the redirect from the authorization server filter chain
                 .formLogin(Customizer.withDefaults())
-                .cors(cors -> cors.configurationSource(corsConfigurationSource()))
-                .csrf(csrf -> csrf.ignoringRequestMatchers("/.well-known/oauth-protected-resource"));
+                .cors(cors -> cors.configurationSource(corsConfigurationSource()));
 
         return http.build();
     }
@@ -284,9 +317,13 @@ public class SecurityConfig {
     }
 
     @Bean
-    public RegisteredClientRepository registeredClientRepository() {
-        RegisteredClient oidcClient = RegisteredClient.withId(UUID.randomUUID().toString())
-                .clientId("client")
+    public RegisteredClient oidcClient(@Value("${app.client-id}") String clientId) {
+        return RegisteredClient.withId(UUID.randomUUID().toString())
+                // Configured (durable) opaque client_id — stable across restarts so previously issued
+                // tokens stay valid. The SPA never hard-codes it; it learns it at runtime by sending its
+                // client_name ("client") to the RFC 7591 registration endpoint (see DCR controller).
+                .clientId(clientId)
+                .clientName("client") // matched by the RFC 7591 registration endpoint (client_name)
                 .clientAuthenticationMethod(ClientAuthenticationMethod.NONE) // Public client (no client secret)
                 .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
                 .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
@@ -306,7 +343,10 @@ public class SecurityConfig {
                         .requireAuthorizationConsent(true) // Show consent screen to support scope changes
                         .build())
                 .build();
+    }
 
+    @Bean
+    public RegisteredClientRepository registeredClientRepository(RegisteredClient oidcClient) {
         return new InMemoryRegisteredClientRepository(oidcClient);
     }
 
